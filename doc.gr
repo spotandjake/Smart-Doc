@@ -1,0 +1,459 @@
+/*
+ * This is a port of the grain pretty printing engine found here:
+ * https://github.com/grain-lang/grain/blob/main/compiler/src/formatting/doc.re
+*/
+
+/**
+  The Doc module implements a document IR and engine for pretty-printing code.
+  Concatenation of Doc.t nodes is O(1) and printing a document is O(n) to the
+  size of the document.
+
+  The most important aspect of the engine are groups and how breaks interact
+  with them. By default, the engine will print a group by either breaking none
+  of the break hints in that group if the entire group would fit on that line
+  (known as Flat mode) or all of the break hints in that group if the group
+  would not fit if printed in Flat mode (known as Breaking mode). This covers
+  95% of formatting use cases, and users should tend to reach for default
+  groups before considering one of the alternatives. For the remaining 5% of
+  use cases, groups can also be created in FitGroups mode or FitAll mode. In
+  FitGroups mode, the engine will attempt to print as many subgroups in Flat
+  mode as possible on each line, breaking only when necessary. In FitAll mode,
+  the engine will attempt to print as many subgroups in Breaking mode as
+  possible on each line.
+
+  Hardlines should be avoided. Instead, emit break hints and allow the engine
+  to decide when breaks should be made. If hardlines must be used, consider
+  using the group's ~print_width parameter to manually specify how wide the
+  engine should consider the group. By default, a group is only considered as
+  wide as the content leading to the first hardline.
+
+  That's most of what you need to know to effectively use this module! Further
+  details on each node are provided below for maintainers or curious consumers.
+
+  IR nodes:
+    • Empty
+      Has no effect on the output of the printing engine.
+    • GroupBreaker
+      Causes the enclosing group to be printed in Breaking mode.
+    • String
+      Prints the string as-is. The `string` function is Utf8-aware.
+    • Blank
+      Prints the specified number of spaces.
+    • BreakHint
+      Tells the engine that a break can be made here. If the engine decides not
+      to print a break, it prints the supplied document instead.
+    • Hardline
+      Forces the engine to print a newline character. Width calculations for
+      the current line are truncated at the Hardline. If the `phantom` field is
+      set to `true`, instead the Hardline is calculated as a zero-width non-
+      breaking character (the newline is emitted in the output, but
+      calculations assume it's just not there).
+    • IfBroken
+      If the engine has broken the current group, prints the `breaking`
+      document and prints the `flat` document otherwise. Note that for FitAll
+      and FitGroups groups, the `flat` document would be printed if the
+      IfBroken node appears before the point at which the group is broken, as
+      the engine makes that decision while printing the group (unlike default
+      groups, where the engine makes this decision before printing the group).
+    • Indent
+      Introduces indentation equal to the number of spaces specified when the
+      enclosing group is broken. When newline characters are emitted, they are
+      followed by space characters equal to the amount of indentation that has
+      been applied by all groups, unless this would lead to trailing
+      whitespace. Note that if the enclosing group has not been broken, the
+      indentation will not apply. For example, in this document,
+        group(~kind=FitGroups, indent(2,
+          group(indent(2, string("foo") ++ break ++ string("bar")))
+        ))
+      if the break hint is broken by the engine, `bar`'s indentation level will
+      only be two spaces, as the outer group could never be broken be broken by
+      the engine.
+    • Group
+      ~kind=Auto
+        The engine checks if the group would fit on the current line if printed
+        in Flat mode. If so, it prints the group in Flat mode and Breaking mode
+        otherwise.
+      ~kind=FitGroups
+        The engine begins printing the group. When it encounters a break hint,
+        it checks if the following node would fit on the current line. If that
+        node is a Group, its Flat mode width is used for the check. If the node
+        would not fit, a break is emitted.
+      ~kind=FitAll
+        The engine begins printing the group. When it encounters a break hint,
+        it checks if the following node would fit on the current line. If that
+        node is a Group, its Breaking mode width is used for the check. If the
+        node would not fit, a break is emitted.
+    • Concat
+      Prints the first document followed by the second document. Keeps track of
+      the combined width to allow the engine to make constant-time decisions
+      about line breaks.
+*/
+module Doc
+
+from "string" include String
+from "buffer" include Buffer
+from "array" include Array
+
+// TODO: Use standard library string.repeat when its added
+let repeat = (c, count) => String.implode(Array.make(count, c))
+
+provide enum EOL {
+  CRLF,
+  LF,
+}
+
+abstract enum rec LayoutNode {
+  Empty,
+  GroupBreaker,
+  String{ value: String, width: Width },
+  Blank{ count: Number, },
+  BreakHint{ doc: LayoutNode, flat_width: Width },
+  Hardline{ phantom: Bool, },
+  IfBroken{
+    flat: LayoutNode,
+    breaking: LayoutNode,
+    flat_width: Width,
+    breaking_width: Width,
+  },
+  Indent{
+    count: Number,
+    doc: LayoutNode,
+    has_group_breaker: Bool,
+    flat_width: Width,
+    breaking_width: Width,
+  },
+  Group{
+    group_type: GroupType,
+    doc: LayoutNode,
+    flat_width: Width,
+    breaking_width: Width,
+  },
+  Concat{
+    left: LayoutNode,
+    right: LayoutNode,
+    has_group_breaker: Bool,
+    flat_width: Width,
+    breaking_width: Width,
+  },
+}
+and provide enum GroupType {
+  Auto,
+  FitGroups,
+  FitAll,
+}
+and abstract enum Width {
+  WithBreak(Number),
+  WithoutBreak(Number),
+}
+
+let breaking_width = doc => {
+  match (doc) {
+    Empty | GroupBreaker => WithoutBreak(0),
+    String{ width, _ } => width,
+    Indent{ breaking_width, _ } |
+    Group{ breaking_width, _ } |
+    Concat{ breaking_width, _ } |
+    IfBroken{ breaking_width, _ } => breaking_width,
+    Blank{ count } => WithoutBreak(count),
+    BreakHint{ _ } | Hardline{ phantom: false } => WithBreak(0),
+    Hardline{ phantom: true } => WithoutBreak(0),
+  }
+}
+
+let flat_width = doc => {
+  match (doc) {
+    Empty | GroupBreaker => WithoutBreak(0),
+    String{ width, _ } => width,
+    Indent{ flat_width, _ } |
+    Group{ flat_width, _ } |
+    Concat{ flat_width, _ } |
+    IfBroken{ flat_width, _ } |
+    BreakHint{ flat_width, _ } => flat_width,
+    Blank{ count } => WithoutBreak(count),
+    Hardline{ phantom: false } => WithBreak(0),
+    Hardline{ phantom: true } => WithoutBreak(0),
+  }
+}
+
+let has_group_breaker = doc => {
+  match (doc) {
+    GroupBreaker => true,
+    Empty |
+    IfBroken{ _ } |
+    BreakHint{ _ } |
+    Blank{ _ } |
+    Hardline{ _ } |
+    Group{ _ } |
+    String{ _ } => false,
+    Concat{ has_group_breaker, _ } | Indent{ has_group_breaker, _ } =>
+      has_group_breaker,
+  }
+}
+
+let width_value = width => {
+  match (width) {
+    WithBreak(w) | WithoutBreak(w) => w,
+  }
+}
+
+provide let group_breaker = GroupBreaker
+provide let string = s =>
+  String{ value: s, width: WithoutBreak(String.length(s)) }
+provide let blank = c => Blank{ count: c }
+// TODO: Change this name
+let _break = doc => BreakHint{ doc, flat_width: flat_width(doc) }
+provide let hardline = Hardline{ phantom: false }
+provide let phantom_hardline = Hardline{ phantom: true }
+provide let if_broken = (breaking, flat) =>
+  IfBroken{
+    flat,
+    breaking,
+    flat_width: flat_width(flat),
+    breaking_width: breaking_width(breaking)
+  }
+provide let indent = (count=2, doc) =>
+  Indent{
+    count,
+    doc,
+    has_group_breaker: has_group_breaker(doc),
+    flat_width: flat_width(doc),
+    breaking_width: breaking_width(doc)
+  }
+provide let group = (print_width=None, kind=Auto, doc) => {
+  let (flat_width, breaking_width) = match (print_width) {
+    Some(width) => (WithoutBreak(width), WithoutBreak(width)),
+    None => (flat_width(doc), breaking_width(doc)),
+  }
+  Group{ group_type: kind, doc, flat_width, breaking_width }
+}
+
+provide let concat = (left, right) => {
+  let add = (left, right) => {
+    match ((left, right)) {
+      (WithBreak(_), _) => left,
+      (WithoutBreak(l), WithoutBreak(r)) => WithoutBreak(l + r),
+      (WithoutBreak(l), WithBreak(r)) => WithBreak(l + r),
+    }
+  }
+
+  let has_group_breaker = has_group_breaker(left) || has_group_breaker(right)
+
+  let (flat_width, breaking_width) = if (has_group_breaker) {
+    let breaking_width = add(breaking_width(left), breaking_width(right))
+    (breaking_width, breaking_width)
+  } else {
+    (
+      add(flat_width(left), flat_width(right)),
+      add(breaking_width(left), breaking_width(right)),
+    )
+  }
+
+  Concat{ left, right, has_group_breaker, flat_width, breaking_width }
+}
+provide let (++) = concat
+
+provide let breakable_space = _break(blank(1))
+provide let _break = _break(Empty)
+provide let space = blank(1)
+provide let empty = Empty
+
+provide let comma = string(",")
+provide let comma_breakable_space = comma ++ breakable_space
+
+provide let concat_map = (sep, lead, trail, f, l) => {
+  match (l) {
+    [] => empty,
+    [first, ..._] => {
+      let rec concat_map = (acc, l) => {
+        match (l) {
+          [] => fail "Impossible: empty list",
+          [ultimate] =>
+            // one element list
+            acc ++ f(final=true, ultimate) ++ trail(ultimate),
+          [penultimate, ultimate] =>
+            acc ++
+              f(final=false, penultimate) ++
+              sep(penultimate, ultimate) ++
+              f(final=true, ultimate) ++
+              trail(ultimate),
+          [elem, next, ...rest] =>
+            concat_map(
+              acc ++ f(final=false, elem) ++ sep(elem, next),
+              [next, ...rest]
+            ),
+        }
+      }
+      concat_map(lead(first), l)
+    },
+  }
+}
+
+provide let parens = (wrap=doc => group(doc), doc) =>
+  wrap(string("(") ++ doc ++ string(")"))
+provide let braces = (wrap=doc => group(doc), doc) =>
+  wrap(string("{") ++ doc ++ string("}"))
+provide let array_brackets = (wrap=doc => group(doc), doc) =>
+  wrap(string("[>") ++ doc ++ string("]"))
+provide let list_brackets = (wrap=doc => group(doc), doc) =>
+  wrap(string("[") ++ doc ++ string("]"))
+provide let angle_brackets = (wrap=doc => group(doc), doc) =>
+  wrap(string("<") ++ doc ++ string(">"))
+
+provide let double_quotes = doc => string("\"") ++ doc ++ string("\"")
+
+provide let trailing_comma = if_broken(string(","), empty)
+
+provide module Engine {
+  enum EngineMode {
+    Flat,
+    Breaking,
+    FitFlat,
+    FitBreaking,
+  }
+
+  record EngineGroup {
+    mode: EngineMode,
+    mut global_indent: Number,
+    mut local_indent: Number,
+    mut broken: Bool,
+  }
+
+  provide let print = (write, eol, line_width, doc) => {
+    // The current column we're writing to
+    let column = box(0)
+    // Queue for indentation to prevent lines with just spaces
+    let write_queue = box(None)
+    // Continuation for Fit mode calculations that depend on the size of the next node
+    let k = box(None)
+
+    let eol = match (eol) {
+      CRLF => "\r\n",
+      LF => "\n",
+    }
+
+    let flush_write_queue = () => {
+      match (unbox(write_queue)) {
+        Some(queued) => {
+          write(queued)
+          write_queue := None
+        },
+        None => void,
+      }
+    }
+
+    let rec print = (group, doc) => {
+      match (unbox(k)) {
+        Some(f) => {
+          k := None
+          f(doc)
+        },
+        None => void,
+      }
+
+      match (doc) {
+        Empty | GroupBreaker => void,
+        String{ value, width } => {
+          flush_write_queue()
+          write(value)
+          column := unbox(column) + width_value(width)
+        },
+        Blank{ count } => {
+          flush_write_queue()
+          write(repeat(' ', count))
+          column := unbox(column) + count
+        },
+        BreakHint{ doc, flat_width: width } => {
+          let _break = () => {
+            group.broken = true
+            group.global_indent = group.global_indent + group.local_indent
+            group.local_indent = 0
+            write(eol)
+            write_queue := Some(repeat(' ', group.global_indent))
+            column := group.global_indent
+          }
+          match (group.mode) {
+            Flat => print(group=group, doc),
+            Breaking => _break(),
+            FitFlat => {
+              k := Some(next_doc => {
+                let next_width = width_value(flat_width(next_doc))
+                let hint_width = width_value(width)
+                if (unbox(column) + hint_width + next_width > line_width) {
+                  _break()
+                } else {
+                  print(group=group, doc)
+                }
+              })
+            },
+            FitBreaking => {
+              k := Some(next_doc => {
+                let next_width = width_value(breaking_width(next_doc))
+                let hint_width = width_value(width)
+                if (unbox(column) + hint_width + next_width > line_width) {
+                  _break()
+                } else {
+                  print(group=group, doc)
+                }
+              })
+            },
+          }
+        },
+        Hardline{ _ } => {
+          group.broken = true
+          group.global_indent = group.global_indent + group.local_indent
+          group.local_indent = 0
+          write(eol)
+          write_queue := Some(repeat(' ', group.global_indent))
+          column := group.global_indent
+        },
+        IfBroken{ flat, breaking, _ } => {
+          if (group.broken) {
+            print(group=group, breaking)
+          } else {
+            print(group=group, flat)
+          }
+        },
+        Indent{ count, doc, _ } => {
+          let global_indent = group.global_indent
+          let local_indent = group.local_indent
+          group.local_indent = local_indent + count
+          print(group=group, doc)
+          group.global_indent = global_indent
+          group.local_indent = local_indent
+        },
+        Group{ doc, group_type, flat_width, _ } => {
+          let width = width_value(flat_width)
+          let mode = match (group_type) {
+            _ when has_group_breaker(doc) => Breaking,
+            Auto when unbox(column) + width > line_width => Breaking,
+            Auto => Flat,
+            FitGroups => FitFlat,
+            FitAll => FitBreaking,
+          }
+
+          let group = {
+            mode,
+            global_indent: group.global_indent,
+            local_indent: 0,
+            broken: has_group_breaker(doc),
+          }
+          print(group=group, doc)
+        },
+        Concat{ left, right, _ } => {
+          print(group=group, left)
+          print(group=group, right)
+        },
+      }
+    }
+
+    let group = { mode: Flat, global_indent: 0, local_indent: 0, broken: false }
+    print(group=group, doc)
+  }
+
+  provide let to_string = (eol, line_width, doc) => {
+    let b = Buffer.make(2048)
+    let write = str => Buffer.addString(str, b)
+    print(write, eol, line_width, doc)
+    Buffer.toString(b)
+  }
+}
